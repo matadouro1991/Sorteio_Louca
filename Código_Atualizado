@@ -1,0 +1,1037 @@
+export default {
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+
+    // Health opcional
+    if (url.pathname === "/health") return new Response("ok", { status: 200 });
+
+    // Telegram Webhook
+    if (url.pathname === "/webhook" && request.method === "POST") {
+      const secretHeader = request.headers.get("X-Telegram-Bot-Api-Secret-Token");
+
+      // proteção básica contra payload gigante
+      const cl = request.headers.get("content-length");
+      if (cl && Number(cl) > 1_000_000) return new Response("payload too large", { status: 413 });
+
+      // valida secret antes de parsear JSON
+      if (env.WEBHOOK_SECRET_CALICE && secretHeader !== env.WEBHOOK_SECRET_CALICE) {
+        return new Response("unauthorized", { status: 401 });
+      }
+
+      try {
+        const update = await request.json();
+        ctx.waitUntil(safeHandleTelegramUpdate(update, env));
+        return new Response("ok", { status: 200 });
+      } catch (e) {
+        logError("webhook_invalid_json", { err: String(e?.message || e) });
+        return new Response("invalid json", { status: 400 });
+      }
+    }
+
+    return new Response("not found", { status: 404 });
+  },
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(safeRunSchedulerTick(env));
+  }
+};
+
+// --------------------
+// Logging (apenas erro e auditoria)
+// --------------------
+function logError(event, data) {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), level: "error", event, ...data }));
+}
+function logAudit(event, data) {
+  console.log(JSON.stringify({ ts: new Date().toISOString(), level: "audit", event, ...data }));
+}
+
+async function safeRunSchedulerTick(env) {
+  try {
+    await runSchedulerTick(env);
+  } catch (e) {
+    logError("cron_crash", { err: String(e?.message || e) });
+  }
+}
+
+async function safeHandleTelegramUpdate(update, env) {
+  try {
+    await handleTelegramUpdate(update, env);
+  } catch (e) {
+    logError("update_crash", { err: String(e?.message || e) });
+  }
+}
+
+// --------------------
+// Timezone São Paulo
+// --------------------
+function saoPauloParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: "America/Sao_Paulo",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23"
+  }).formatToParts(date);
+
+  const obj = {};
+  for (const p of parts) obj[p.type] = p.value;
+  return obj;
+}
+
+function spDateInfo(date = new Date()) {
+  const p = saoPauloParts(date);
+  const yyyy = parseInt(p.year, 10);
+  const mm = parseInt(p.month, 10);
+  const dd = parseInt(p.day, 10);
+  const hour = parseInt(p.hour, 10);
+  const minute = parseInt(p.minute, 10);
+  const weekday = new Date(Date.UTC(yyyy, mm - 1, dd)).getUTCDay(); // 0=Dom..6=Sáb
+  return { yyyy, mm, dd, hour, minute, weekday };
+}
+
+function pad2(n) {
+  return String(n).padStart(2, "0");
+}
+
+function ymd({ yyyy, mm, dd }) {
+  return `${yyyy}-${pad2(mm)}-${pad2(dd)}`;
+}
+
+function weekdayNamePT(dow) {
+  return ["Domingo", "Segunda", "Terça", "Quarta", "Quinta", "Sexta", "Sábado"][dow] || "—";
+}
+
+// semana começa na segunda (Mon=0..Sun=6)
+function weekIndexMonStart(dow) {
+  return (dow + 6) % 7;
+}
+
+function toWeekMinuteMonStart(dow, hh, mm) {
+  return weekIndexMonStart(dow) * 1440 + hh * 60 + mm;
+}
+
+function weekKeyFromSPDate(info) {
+  const base = new Date(Date.UTC(info.yyyy, info.mm - 1, info.dd));
+  const dow = base.getUTCDay(); // 0..6
+  const daysSinceMonday = (dow + 6) % 7; // Mon=0..Sun=6
+  const monday = new Date(base.getTime() - daysSinceMonday * 86400000);
+  return `week:${monday.getUTCFullYear()}-${pad2(monday.getUTCMonth() + 1)}-${pad2(monday.getUTCDate())}`;
+}
+
+function timeIsAtOrPast(now, hh, mm) {
+  return now.hour > hh || (now.hour === hh && now.minute >= mm);
+}
+
+function formatSchedule(cfg) {
+  return `Disparo: ${weekdayNamePT(cfg.send_weekday)} às ${pad2(cfg.send_hour)}:${pad2(cfg.send_minute)}`;
+}
+
+function deepClone(obj) {
+  return JSON.parse(JSON.stringify(obj));
+}
+
+// --------------------
+// RNG
+// --------------------
+function rand01() {
+  const buf = new Uint32Array(1);
+  crypto.getRandomValues(buf);
+  return (buf[0] + 1) / (0xffffffff + 2);
+}
+
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rand01() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// Efraimidis–Spirakis (ponderado sem reposição)
+function sampleWeightedNoReplace(items, k) {
+  return (items || [])
+    .filter(it => Number(it.peso) > 0 && String(it.nome || "").trim())
+    .map(it => {
+      const w = Number(it.peso);
+      const u = rand01();
+      const key = -Math.log(u) / w; // menor = mais provável
+      return { it, key };
+    })
+    .sort((a, b) => a.key - b.key)
+    .slice(0, Math.max(0, k))
+    .map(x => x.it);
+}
+
+// --------------------
+// KV
+// --------------------
+const DATA_KEY = "louca.json";
+const EDIT_LOCK_KEY = "edit_lock";
+
+function defaultData() {
+  return {
+    config: { send_weekday: 0, send_hour: 20, send_minute: 0 },
+    people: [],
+    last_draw: null,
+    last_sent_week_key: null,
+    last_weekend_prompt_date: null
+  };
+}
+
+async function loadData(env) {
+  const raw = await env.DATA.get(DATA_KEY);
+  if (!raw) return defaultData();
+
+  let d;
+  try {
+    d = JSON.parse(raw);
+  } catch (e) {
+    logError("kv_json_corrupted_reset", { key: DATA_KEY, err: String(e?.message || e) });
+    return defaultData();
+  }
+
+  const def = defaultData();
+  d.config ||= def.config;
+  d.people ||= [];
+  d.last_draw ||= null;
+  d.last_sent_week_key ||= null;
+  d.last_weekend_prompt_date ||= null;
+
+  if (!Number.isInteger(d.config.send_weekday)) d.config.send_weekday = def.config.send_weekday;
+  if (!Number.isInteger(d.config.send_hour)) d.config.send_hour = def.config.send_hour;
+  if (!Number.isInteger(d.config.send_minute)) d.config.send_minute = def.config.send_minute;
+
+  return d;
+}
+
+async function saveData(env, data) {
+  await env.DATA.put(DATA_KEY, JSON.stringify(data, null, 2));
+}
+
+// sessão (1h)
+function sessionKey(chatId) {
+  return `session:${chatId}`;
+}
+
+async function loadSession(env, chatId) {
+  const raw = await env.DATA.get(sessionKey(chatId));
+  if (!raw) return newSession();
+  try {
+    const s = JSON.parse(raw);
+    s.passwordFails ||= 0;
+    s.draft ||= {};
+    s.lockOwned ||= false;
+    return s;
+  } catch {
+    return newSession();
+  }
+}
+
+function newSession() {
+  return {
+    authed: false,
+    awaitingPassword: false,
+    passwordFails: 0,
+    mode: null,
+    index: null,
+    field: null,
+    draft: {},
+    dataDraft: null,
+    adminName: null,
+    lockOwned: false
+  };
+}
+
+async function saveSession(env, chatId, sess) {
+  await env.DATA.put(sessionKey(chatId), JSON.stringify(sess), { expirationTtl: 60 * 60 });
+}
+
+async function clearSession(env, chatId) {
+  await env.DATA.delete(sessionKey(chatId));
+}
+
+function resetFlow(sess) {
+  sess.mode = null;
+  sess.index = null;
+  sess.field = null;
+  sess.draft = {};
+}
+
+// lock editor simples (30 min)
+async function tryAcquireEditLock(env, chatId, adminName) {
+  const raw = await env.DATA.get(EDIT_LOCK_KEY);
+  if (raw) {
+    try {
+      const lock = JSON.parse(raw);
+      if (String(lock.chatId) === String(chatId)) {
+        await env.DATA.put(
+          EDIT_LOCK_KEY,
+          JSON.stringify({ chatId, adminName, at: Date.now() }),
+          { expirationTtl: 30 * 60 }
+        );
+        return { ok: true, owned: true };
+      }
+      return { ok: false, owned: false, holder: lock };
+    } catch {}
+  }
+
+  await env.DATA.put(
+    EDIT_LOCK_KEY,
+    JSON.stringify({ chatId, adminName, at: Date.now() }),
+    { expirationTtl: 30 * 60 }
+  );
+  return { ok: true, owned: true };
+}
+
+async function releaseEditLockIfOwned(env, chatId) {
+  const raw = await env.DATA.get(EDIT_LOCK_KEY);
+  if (!raw) return;
+  try {
+    const lock = JSON.parse(raw);
+    if (String(lock.chatId) === String(chatId)) await env.DATA.delete(EDIT_LOCK_KEY);
+  } catch {}
+}
+
+// --------------------
+// Telegram API
+// --------------------
+function getToken(env) {
+  return env.Token_Calice;
+}
+function getGroupChatId(env) {
+  return env.Chat_Grupo_Calice;
+}
+
+async function tg(method, env, body) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), 7000);
+
+  try {
+    const resp = await fetch(`https://api.telegram.org/bot${getToken(env)}/${method}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+
+    const json = await resp.json().catch(() => ({}));
+
+    // ignora erro "message is not modified"
+    if (
+      json?.ok === false &&
+      json?.error_code === 400 &&
+      typeof json?.description === "string" &&
+      json.description.includes("message is not modified")
+    ) {
+      return { ok: true, ignored: true };
+    }
+
+    if (!json?.ok) {
+      logError("telegram_api_error", {
+        method,
+        http_status: resp.status,
+        description: json?.description,
+        error_code: json?.error_code
+      });
+    }
+    return json;
+  } catch (e) {
+    logError("telegram_fetch_failed", { method, err: String(e?.message || e) });
+    return { ok: false };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function sendMessage(env, chat_id, text, reply_markup) {
+  const payload = { chat_id, text };
+  if (reply_markup) payload.reply_markup = reply_markup;
+  return tg("sendMessage", env, payload);
+}
+
+async function editMessageText(env, chat_id, message_id, text, reply_markup) {
+  const payload = { chat_id, message_id, text };
+  if (reply_markup) payload.reply_markup = reply_markup;
+  return tg("editMessageText", env, payload);
+}
+
+async function answerCallbackQuery(env, callback_query_id) {
+  return tg("answerCallbackQuery", env, { callback_query_id });
+}
+
+function commandName(text) {
+  const t = String(text || "").trim();
+  if (!t.startsWith("/")) return "";
+  const first = t.split(/\s+/)[0];
+  return first.split("@")[0];
+}
+
+// --------------------
+// UI / Menus
+// --------------------
+function mainMenu() {
+  return {
+    inline_keyboard: [
+      [{ text: "👥 Moradores", callback_data: "menu:people" }],
+      [{ text: "⏰ Alterar disparo", callback_data: "menu:schedule" }],
+      [{ text: "📋 Informações", callback_data: "menu:info" }],
+      [{ text: "✅ Salvar e sair", callback_data: "menu:save_exit" }],
+      [{ text: "❌ Sair sem salvar", callback_data: "menu:exit" }]
+    ]
+  };
+}
+
+function peopleMenu(people) {
+  const rows = [];
+  (people || []).forEach((p, i) => {
+    rows.push([{ text: `- ${p.nome} (${p.peso})`, callback_data: `person:${i}` }]);
+  });
+  rows.push([{ text: "➕ Adicionar", callback_data: "add" }]);
+  rows.push([{ text: "↩️ Voltar", callback_data: "menu:main" }]);
+  return { inline_keyboard: rows };
+}
+
+function personActionsMenu(idx) {
+  return {
+    inline_keyboard: [
+      [{ text: "Editar nome", callback_data: `edit:${idx}:nome` }],
+      [{ text: "Editar peso", callback_data: `edit:${idx}:peso` }],
+      [{ text: "Remover", callback_data: `rm:${idx}` }],
+      [{ text: "↩️ Voltar", callback_data: "menu:people" }]
+    ]
+  };
+}
+
+function scheduleMenu() {
+  return {
+    inline_keyboard: [
+      [{ text: "📅 Mudar dia", callback_data: "sched:weekday" }],
+      [{ text: "🕒 Mudar hora", callback_data: "sched:time" }],
+      [{ text: "↩️ Voltar", callback_data: "menu:main" }]
+    ]
+  };
+}
+
+function weekdayPicker() {
+  return {
+    inline_keyboard: [
+      [{ text: "Domingo", callback_data: "setdow:0" }],
+      [{ text: "Segunda", callback_data: "setdow:1" }],
+      [{ text: "Terça", callback_data: "setdow:2" }],
+      [{ text: "Quarta", callback_data: "setdow:3" }],
+      [{ text: "Quinta", callback_data: "setdow:4" }],
+      [{ text: "Sexta", callback_data: "setdow:5" }],
+      [{ text: "Sábado", callback_data: "setdow:6" }],
+      [{ text: "↩️ Voltar", callback_data: "menu:schedule" }]
+    ]
+  };
+}
+
+// --------------------
+// Validations
+// --------------------
+function validatePerson(p) {
+  const nome = String(p.nome || "").trim();
+  const peso = Number(p.peso);
+  if (!nome) return "Nome vazio";
+  if (!Number.isInteger(peso) || peso < 1 || peso > 1000) return "Peso deve ser um inteiro entre 1 e 1000";
+  return null;
+}
+
+function validateSchedule(cfg) {
+  const w = Number(cfg.send_weekday);
+  const h = Number(cfg.send_hour);
+  const m = Number(cfg.send_minute);
+  if (!Number.isInteger(w) || w < 0 || w > 6) return "Dia inválido";
+  if (!Number.isInteger(h) || h < 0 || h > 23) return "Hora inválida";
+  if (!Number.isInteger(m) || m < 0 || m > 59) return "Minuto inválido";
+  return null;
+}
+
+// --------------------
+// Sorteio
+// --------------------
+function buildWeeklyDraw(data) {
+  const people = (data.people || []).map(p => ({
+    nome: String(p.nome || "").trim(),
+    peso: Number(p.peso)
+  }));
+
+  const weekPicks = sampleWeightedNoReplace(people, 5);
+  const chosen = new Set(weekPicks.map(x => x.nome));
+  const remaining = people.filter(p => !chosen.has(p.nome));
+  const reserves = sampleWeightedNoReplace(remaining, 5);
+
+  const weekList = shuffleInPlace([...weekPicks]).map(p => p.nome);
+  const reservesList = shuffleInPlace([...reserves]).map(p => p.nome);
+
+  while (weekList.length < 5) weekList.push("X");
+  while (reservesList.length < 5) reservesList.push("X");
+
+  const days = ["Segunda", "Terça", "Quarta", "Quinta", "Sexta"];
+
+  let msg = "SORTEIO DA SEMANA:\n\n";
+  for (let i = 0; i < 5; i++) msg += `${days[i]} - ${weekList[i]}\n`;
+
+  msg += "\nRESERVAS:\n";
+  for (let i = 0; i < 5; i++) msg += `${i + 1}) ${reservesList[i]}\n`;
+
+  return { week: weekList, reserves: reservesList, message: msg.trimEnd() };
+}
+
+// --------------------
+// Auditoria de mudanças (diff)
+// --------------------
+function diffData(before, after) {
+  const out = [];
+
+  const b = before?.config || {};
+  const a = after?.config || {};
+  if (b.send_weekday !== a.send_weekday || b.send_hour !== a.send_hour || b.send_minute !== a.send_minute) {
+    out.push(
+      `config: { send_weekday: ${b.send_weekday}, send_hour: ${b.send_hour}, send_minute: ${b.send_minute} } -> ` +
+      `{ send_weekday: ${a.send_weekday}, send_hour: ${a.send_hour}, send_minute: ${a.send_minute} }`
+    );
+  }
+
+  const bp = (before?.people || []).map(p => ({ nome: String(p.nome), peso: Number(p.peso) }));
+  const ap = (after?.people || []).map(p => ({ nome: String(p.nome), peso: Number(p.peso) }));
+
+  const max = Math.max(bp.length, ap.length);
+  for (let i = 0; i < max; i++) {
+    const x = bp[i];
+    const y = ap[i];
+    if (!x && y) out.push(`people.push(${JSON.stringify(y)})`);
+    else if (x && !y) out.push(`people.splice(${i}, 1) // removed ${JSON.stringify(x)}`);
+    else if (x && y && (x.nome !== y.nome || x.peso !== y.peso)) out.push(`people[${i}] = ${JSON.stringify(y)} // was ${JSON.stringify(x)}`);
+  }
+
+  return out;
+}
+
+// Aplica somente edições (people/config) preservando runtime do KV
+function mergeDraftIntoFresh(fresh, draft) {
+  fresh.config = draft.config;
+  fresh.people = draft.people;
+  return fresh;
+}
+
+// --------------------
+// Scheduler (cron)
+// --------------------
+async function runSchedulerTick(env) {
+  const now = spDateInfo();
+  const today = ymd(now);
+
+  if (!getToken(env) || !getGroupChatId(env)) {
+    logError("cron_missing_env", { Token_Calice: !!env.Token_Calice, Chat_Grupo_Calice: !!env.Chat_Grupo_Calice });
+    return;
+  }
+
+  const data = await loadData(env);
+  const cfg = data.config || {};
+  const wk = weekKeyFromSPDate(now);
+
+  // 1) Mensagem fixa: domingo 12:00 SP (sempre)
+  if (now.weekday === 0 && timeIsAtOrPast(now, 12, 0)) {
+    if (data.last_weekend_prompt_date !== today) {
+      const sent = await sendMessage(
+        env,
+        getGroupChatId(env),
+        "Já foi definido quem é o responsável pela louça do final de semana? 👀",
+        null
+      );
+      if (sent?.ok) {
+        data.last_weekend_prompt_date = today;
+        await saveData(env, data);
+      } else {
+        logError("weekend_prompt_send_failed", { date: today, sp_time: `${pad2(now.hour)}:${pad2(now.minute)}` });
+        return;
+      }
+    }
+  }
+
+  // 2) Sorteio configurável: dia certo e >= horário (janela)
+  const dayOk = now.weekday === cfg.send_weekday;
+  const timeOk = timeIsAtOrPast(now, cfg.send_hour, cfg.send_minute);
+  const alreadySentThisWeek = data.last_sent_week_key === wk;
+
+  if (!dayOk) return;
+  if (!timeOk) return;
+  if (alreadySentThisWeek) return;
+
+  const draw = buildWeeklyDraw(data);
+
+  const sent = await sendMessage(env, getGroupChatId(env), draw.message, null);
+  if (!sent?.ok) {
+    logError("draw_send_failed_retry_next_tick", { sp_time: `${pad2(now.hour)}:${pad2(now.minute)}`, weekKey: wk });
+    return;
+  }
+
+  data.last_draw = {
+    at: `${today} ${pad2(now.hour)}:${pad2(now.minute)}`,
+    week_key: wk,
+    week: draw.week,
+    reserves: draw.reserves
+  };
+  data.last_sent_week_key = wk;
+  await saveData(env, data);
+}
+
+// --------------------
+// Telegram update handler
+// --------------------
+async function handleTelegramUpdate(update, env) {
+  // callback_query (botões)
+  if (update.callback_query) {
+    const cq = update.callback_query;
+    const chatId = cq.message?.chat?.id;
+    const msgId = cq.message?.message_id;
+    if (!chatId || !msgId) return;
+
+    await answerCallbackQuery(env, cq.id);
+
+    const isPrivate = cq.message?.chat?.type === "private";
+    if (!isPrivate) {
+      await sendMessage(env, chatId, "Me chama no privado pra editar 👀🔥", null);
+      return;
+    }
+
+    const sess = await loadSession(env, chatId);
+    if (!sess.authed) {
+      await sendMessage(env, chatId, "Comece com /editar", null);
+      return;
+    }
+
+    if (!sess.dataDraft) sess.dataDraft = await loadData(env);
+    const draftData = sess.dataDraft;
+
+    const parts = String(cq.data || "").split(":");
+    const type = parts[0];
+
+    if (type === "menu") {
+      const which = parts[1];
+
+      if (which === "main") {
+        resetFlow(sess);
+        await saveSession(env, chatId, sess);
+        await editMessageText(env, chatId, msgId, "Escolha sua opção:", mainMenu());
+        return;
+      }
+
+      if (which === "people") {
+        resetFlow(sess);
+        await saveSession(env, chatId, sess);
+        await editMessageText(env, chatId, msgId, "👥 Moradores", peopleMenu(draftData.people));
+        return;
+      }
+
+      if (which === "schedule") {
+        resetFlow(sess);
+        await saveSession(env, chatId, sess);
+        const text = `⏰ Agendamento\n${formatSchedule(draftData.config)}`;
+        await editMessageText(env, chatId, msgId, text, scheduleMenu());
+        return;
+      }
+
+      if (which === "info") {
+        // peso crescente, empate por ordem de adição
+        const sorted = (draftData.people || [])
+          .map((p, idx) => ({ ...p, __idx: idx }))
+          .sort((a, b) => (Number(a.peso) - Number(b.peso)) || (a.__idx - b.__idx));
+
+        const lines = sorted.length
+          ? sorted.map(p => `${p.nome} (Peso ${p.peso})`).join("\n")
+          : "(sem pessoas cadastradas)";
+
+        const text =
+          `LISTA DE PESSOAS:\n` +
+          `${lines}\n\n` +
+          `${formatSchedule(draftData.config)}`;
+
+        await sendMessage(env, chatId, text, null);
+        await editMessageText(env, chatId, msgId, "Escolha sua opção:", mainMenu());
+        return;
+      }
+
+      if (which === "save_exit") {
+        const fresh = await loadData(env);
+        const before = deepClone(fresh);
+
+        // aplica somente people/config no fresh (preserva runtime)
+        const merged = mergeDraftIntoFresh(fresh, draftData);
+
+        // ✅ REGRA "Caso B": só reseta se o NOVO disparo ainda NÃO aconteceu nesta semana (semana começa segunda)
+        const scheduleChanged =
+          (before.config?.send_weekday !== merged.config?.send_weekday) ||
+          (before.config?.send_hour !== merged.config?.send_hour) ||
+          (before.config?.send_minute !== merged.config?.send_minute);
+
+        if (scheduleChanged) {
+          const now = spDateInfo();
+          const nowWm = toWeekMinuteMonStart(now.weekday, now.hour, now.minute);
+          const newWm = toWeekMinuteMonStart(merged.config.send_weekday, merged.config.send_hour, merged.config.send_minute);
+
+          // apenas se o novo horário está no FUTURO dentro desta semana (Mon..Sun)
+          if (newWm > nowWm) {
+            merged.last_sent_week_key = null;
+            merged.last_draw = null;
+
+            logAudit("schedule_changed_reset_last_sent_future_only", {
+              adminName: sess.adminName,
+              adminChatId: chatId,
+              from: before.config,
+              to: merged.config
+            });
+          }
+        }
+
+        await saveData(env, merged);
+
+        const changes = diffData(before, merged);
+
+        const who = sess.adminName || "Alguém";
+        await sendMessage(env, getGroupChatId(env), `${who} atualizou as configurações.`, null);
+
+        logAudit("audit_save_exit", {
+          adminName: sess.adminName,
+          adminChatId: chatId,
+          changes
+        });
+
+        await sendMessage(env, chatId, "✅ Configurações salvas", null);
+        await sendMessage(env, chatId, "❤️🖤 Vida longa à Matadouro 🐂🍺", null);
+
+        await releaseEditLockIfOwned(env, chatId);
+        await clearSession(env, chatId);
+        return;
+      }
+
+      if (which === "exit") {
+        await sendMessage(env, chatId, "Saindo sem salvar. Nada foi alterado.", null);
+        await releaseEditLockIfOwned(env, chatId);
+        await clearSession(env, chatId);
+        return;
+      }
+    }
+
+    if (type === "person") {
+      const idx = Number(parts[1]);
+      const p = draftData.people[idx];
+      if (!p) {
+        await sendMessage(env, chatId, "Morador não encontrado.", null);
+        return;
+      }
+      const text = `Nome: ${p.nome}\nPeso: ${p.peso}`;
+      resetFlow(sess);
+      await saveSession(env, chatId, sess);
+      await editMessageText(env, chatId, msgId, text, personActionsMenu(idx));
+      return;
+    }
+
+    if (type === "add") {
+      sess.mode = "add";
+      sess.draft = {};
+      await saveSession(env, chatId, sess);
+      await sendMessage(env, chatId, "Qual o nome?", null);
+      return;
+    }
+
+    if (type === "edit") {
+      const idx = Number(parts[1]);
+      const field = parts[2];
+      const p = draftData.people[idx];
+      if (!p) {
+        await sendMessage(env, chatId, "Morador não encontrado.", null);
+        return;
+      }
+
+      sess.mode = "edit";
+      sess.index = idx;
+      sess.field = field;
+      await saveSession(env, chatId, sess);
+
+      if (field === "nome") await sendMessage(env, chatId, "Novo nome:", null);
+      if (field === "peso") await sendMessage(env, chatId, "Envie o novo peso (inteiro >= 1):", null);
+      return;
+    }
+
+    if (type === "rm") {
+      const idx = Number(parts[1]);
+      const p = draftData.people[idx];
+      if (!p) {
+        await sendMessage(env, chatId, "Morador não encontrado.", null);
+        return;
+      }
+
+      draftData.people.splice(idx, 1);
+      resetFlow(sess);
+      await saveSession(env, chatId, sess);
+
+      await sendMessage(env, chatId, `${p.nome} removido, salve antes de sair`, null);
+      await editMessageText(env, chatId, msgId, "👥 Moradores", peopleMenu(draftData.people));
+      return;
+    }
+
+    if (type === "sched") {
+      const what = parts[1];
+
+      if (what === "weekday") {
+        sess.mode = "schedule";
+        sess.field = "weekday";
+        await saveSession(env, chatId, sess);
+        await sendMessage(env, chatId, "Escolha o dia da semana:", weekdayPicker());
+        return;
+      }
+
+      if (what === "time") {
+        sess.mode = "schedule";
+        sess.field = "time";
+        await saveSession(env, chatId, sess);
+        await sendMessage(env, chatId, "Envie a nova hora do disparo.\nFormato: HH:mm", null);
+        return;
+      }
+    }
+
+    if (type === "setdow") {
+      const dow = Number(parts[1]);
+      draftData.config.send_weekday = dow;
+
+      const err = validateSchedule(draftData.config);
+      if (err) {
+        await sendMessage(env, chatId, "Dia inválido.", null);
+        return;
+      }
+
+      resetFlow(sess);
+      await saveSession(env, chatId, sess);
+
+      await sendMessage(env, chatId, `✅ Dia atualizado, salve antes de sair.\n${formatSchedule(draftData.config)}`, null);
+      await editMessageText(env, chatId, msgId, "Escolha sua opção:", mainMenu());
+      return;
+    }
+
+    return;
+  }
+
+  // message (texto)
+  const msg = update.message;
+  if (!msg || !msg.chat) return;
+
+  const chatId = msg.chat.id;
+  const chatType = msg.chat.type;
+  const text = String(msg.text || "").trim();
+  const cmd = commandName(text);
+
+  // /refazer no grupo
+  if (cmd === "/refazer") {
+    const groupId = String(getGroupChatId(env));
+    if (String(chatId) !== groupId) return;
+
+    const data = await loadData(env);
+    const draw = buildWeeklyDraw(data);
+    const sent = await sendMessage(env, chatId, draw.message, null);
+    if (!sent?.ok) return;
+
+    // Atualiza last_draw (não mexe em last_sent_week_key)
+    const now = spDateInfo();
+    data.last_draw = {
+      at: `${ymd(now)} ${pad2(now.hour)}:${pad2(now.minute)}`,
+      week_key: weekKeyFromSPDate(now),
+      week: draw.week,
+      reserves: draw.reserves
+    };
+    await saveData(env, data);
+    return;
+  }
+
+  const isPrivate = chatType === "private";
+
+  // /editar editor
+  if (cmd === "/editar") {
+    if (!isPrivate) {
+      await sendMessage(env, chatId, "Me chama no privado pra editar 👀🔥", null);
+      return;
+    }
+
+    const sess = newSession();
+    sess.awaitingPassword = true;
+    await saveSession(env, chatId, sess);
+
+    await sendMessage(env, chatId, "Seja bem vindo ao editor do sorteio de louças da República Matadouro.", null);
+    await sendMessage(env, chatId, "Tudo que você edita aqui é mandado para o grupo 👀", null);
+    await sendMessage(env, chatId, "Qual é a senha?", null);
+    return;
+  }
+
+  if (!isPrivate) return;
+
+  let sess = await loadSession(env, chatId);
+
+  if (!sess.awaitingPassword && !sess.authed && !sess.mode) {
+    await sendMessage(env, chatId, "Comece com /editar", null);
+    return;
+  }
+
+  // autenticação
+  if (!sess.authed) {
+    if (!sess.awaitingPassword) {
+      await sendMessage(env, chatId, "Comece com /editar", null);
+      return;
+    }
+
+    if (!env.ADMIN_PASSWORD_CALICE) {
+      await sendMessage(env, chatId, "ADMIN_PASSWORD_CALICE não configurada no servidor.", null);
+      return;
+    }
+
+    if (text === env.ADMIN_PASSWORD_CALICE) {
+      const from = msg.from || {};
+      const who =
+        [from.first_name, from.last_name].filter(Boolean).join(" ").trim() ||
+        (from.username ? `@${from.username}` : null) ||
+        "Alguém";
+
+      const lock = await tryAcquireEditLock(env, chatId, who);
+      if (!lock.ok) {
+        await sendMessage(env, chatId, "O editor já tá aberto em outro chat. Tenta de novo em alguns minutos.", null);
+        return;
+      }
+
+      sess.authed = true;
+      sess.awaitingPassword = false;
+      sess.passwordFails = 0;
+      sess.dataDraft = await loadData(env);
+      sess.adminName = who;
+      sess.lockOwned = true;
+
+      await saveSession(env, chatId, sess);
+
+      await sendMessage(env, chatId, "Escolha sua opção:", mainMenu());
+      return;
+    }
+
+    sess.passwordFails = (sess.passwordFails || 0) + 1;
+
+    if (sess.passwordFails >= 5) {
+      sess.awaitingPassword = false;
+      await saveSession(env, chatId, sess);
+      await sendMessage(env, chatId, "Parece que alguém quer ficar chutando é? Calma aí Sherlock Holmes.", null);
+      return;
+    }
+
+    await saveSession(env, chatId, sess);
+    await sendMessage(env, chatId, "Você errou a senha seu imundo! Tente novamente.", null);
+    return;
+  }
+
+  // garante draft
+  if (!sess.dataDraft) sess.dataDraft = await loadData(env);
+  const draftData = sess.dataDraft;
+
+  // fluxo ADD
+  if (sess.mode === "add") {
+    const draft = sess.draft || {};
+
+    if (!draft.nome) {
+      draft.nome = text;
+      sess.draft = draft;
+      await saveSession(env, chatId, sess);
+      await sendMessage(env, chatId, "Agora envie o peso (inteiro >= 1):", null);
+      return;
+    }
+
+    if (draft.peso == null) {
+      const peso = Number(text);
+      if (!Number.isInteger(peso)) {
+        await sendMessage(env, chatId, "Peso inválido. Envie um inteiro (ex: 2).", null);
+        return;
+      }
+      draft.peso = peso;
+
+      const err = validatePerson(draft);
+      if (err) {
+        await sendMessage(env, chatId, `Erro: ${err}\nOperação cancelada. Recomece com /editar.`, null);
+        await releaseEditLockIfOwned(env, chatId);
+        await clearSession(env, chatId);
+        return;
+      }
+
+      draftData.people.push({ nome: String(draft.nome).trim(), peso: draft.peso });
+      resetFlow(sess);
+      await saveSession(env, chatId, sess);
+
+      await sendMessage(env, chatId, "✅ Morador adicionado, salve antes de sair", mainMenu());
+      return;
+    }
+  }
+
+  // fluxo EDIT
+  if (sess.mode === "edit" && sess.index != null && sess.field) {
+    const idx = Number(sess.index);
+    const field = sess.field;
+    const p = draftData.people[idx];
+
+    if (!p) {
+      await sendMessage(env, chatId, "Morador não encontrado.", null);
+      resetFlow(sess);
+      await saveSession(env, chatId, sess);
+      return;
+    }
+
+    try {
+      if (field === "nome") p.nome = text;
+      if (field === "peso") {
+        const peso = Number(text);
+        if (!Number.isInteger(peso)) throw new Error("Peso inválido");
+        p.peso = peso;
+      }
+
+      const err = validatePerson(p);
+      if (err) throw new Error(err);
+
+      resetFlow(sess);
+      await saveSession(env, chatId, sess);
+
+      await sendMessage(env, chatId, "✅ Atualizado, salve antes de sair", mainMenu());
+      return;
+    } catch (e) {
+      await sendMessage(env, chatId, `Erro: ${e.message}\nTente novamente.`, null);
+      return;
+    }
+  }
+
+  // fluxo schedule (HH:mm)
+  if (sess.mode === "schedule" && sess.field === "time") {
+    const m = text.match(/^(\d{2}):(\d{2})$/);
+    if (!m) {
+      await sendMessage(env, chatId, "Formato inválido, tente novamente", null);
+      return;
+    }
+
+    const hh = Number(m[1]);
+    const mm = Number(m[2]);
+
+    draftData.config.send_hour = hh;
+    draftData.config.send_minute = mm;
+
+    const err = validateSchedule(draftData.config);
+    if (err) {
+      await sendMessage(env, chatId, "Formato inválido, tente novamente", null);
+      return;
+    }
+
+    resetFlow(sess);
+    await saveSession(env, chatId, sess);
+
+    await sendMessage(env, chatId, `✅ Disparo atualizado, salve antes de sair\n${formatSchedule(draftData.config)}`, mainMenu());
+    return;
+  }
+
+  // fallback
+  await sendMessage(env, chatId, "Escolha sua opção:", mainMenu());
+}
